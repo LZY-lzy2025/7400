@@ -189,7 +189,7 @@ def scrape_job():
         # 按行写入 JSON，方便带上比赛信息供接口读取
         for item in final_data:
             f.write(json.dumps(item, ensure_ascii=False) + '\n')
-    print(f"任务完成，共保存 {len(final_data)} 个独立比赛源。")
+    print(f"任务完成，共保存 {len(final_data)} 个独立字符。")
 
 # ==========================================
 # 统一的播放列表生成逻辑 (支持 M3U 和 TXT)
