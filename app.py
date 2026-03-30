@@ -95,7 +95,8 @@ def scrape_job():
         print(f"获取主页失败: {e}")
         return
 
-    links_to_visit = []
+    # 存储比赛基础信息：match_id -> info_dict
+    match_infos = {} 
     
     # 定义时间窗口：当前时间前 4 小时 到 后 1 小时
     lower_bound = now - timedelta(hours=4)
@@ -113,12 +114,33 @@ def scrape_job():
                 # 判断比赛时间是否在允许的时间窗口内
                 if lower_bound <= match_time <= upper_bound:
                     match_id = href.split('/')[-1]
-                    links_to_visit.append(f"https://www.74001.tv/live/{match_id}")
+                    
+                    # 提取联赛名、对阵双方和显示时间
+                    em_tag = a.select_one('.eventtime em')
+                    league = em_tag.text.strip() if em_tag else "未知联赛"
+                    
+                    zhudui_tag = a.select_one('.zhudui p')
+                    home = zhudui_tag.text.strip() if zhudui_tag else "未知主队"
+                    
+                    kedui_tag = a.select_one('.kedui p')
+                    away = kedui_tag.text.strip() if kedui_tag else "未知客队"
+                    
+                    time_i_tag = a.select_one('.eventtime i')
+                    display_time = time_i_tag.text.strip() if time_i_tag else match_time.strftime('%H:%M')
+                    
+                    match_infos[match_id] = {
+                        'time': display_time,
+                        'league': league, # 依然保留抓取，防止未来需要
+                        'home': home,
+                        'away': away
+                    }
             except Exception:
                 continue
 
-    play_urls = []
-    for link in set(links_to_visit):
+    # 存储内页原始播放链接映射：play_url -> info_dict
+    play_url_to_info = {}
+    for match_id, info in match_infos.items():
+        link = f"https://www.74001.tv/live/{match_id}"
         try:
             res = requests.get(link, headers=headers, timeout=10)
             soup = BeautifulSoup(res.text, 'html.parser')
@@ -130,15 +152,16 @@ def scrape_job():
                     if m:
                         raw_url = m.group(1)
                         url = 'http://' + raw_url.replace('!', '.').replace('&nbsp', 'com').replace('*', '/')
-                        play_urls.append(url)
+                        play_url_to_info[url] = info
         except Exception as e:
             continue
 
-    final_ids = []
+    final_data = []
+    seen_ids = set()
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
         page = browser.new_page()
-        for url in set(play_urls):
+        for url, info in play_url_to_info.items():
             try:
                 requests_list = []
                 page.on("request", lambda request: requests_list.append(request.url))
@@ -146,7 +169,16 @@ def scrape_job():
                 for req_url in requests_list:
                     if 'paps.html?id=' in req_url:
                         extracted_id = req_url.split('paps.html?id=')[-1]
-                        final_ids.append(extracted_id)
+                        if extracted_id not in seen_ids:
+                            # 将 ID 和赛事信息打包成字典
+                            final_data.append({
+                                'id': extracted_id,
+                                'time': info['time'],
+                                'league': info['league'],
+                                'home': info['home'],
+                                'away': info['away']
+                            })
+                            seen_ids.add(extracted_id)
                         break
             except Exception:
                 continue
@@ -154,9 +186,10 @@ def scrape_job():
 
     os.makedirs('output', exist_ok=True)
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        for fid in set(final_ids):
-            f.write(fid + '\n')
-    print(f"任务完成，共保存 {len(set(final_ids))} 个独立 ID。")
+        # 按行写入 JSON，方便带上比赛信息供接口读取
+        for item in final_data:
+            f.write(json.dumps(item, ensure_ascii=False) + '\n')
+    print(f"任务完成，共保存 {len(final_data)} 个独立比赛源。")
 
 # ==========================================
 # 统一的播放列表生成逻辑 (支持 M3U 和 TXT)
@@ -166,7 +199,7 @@ def generate_playlist(fmt="m3u", mode="clean"):
         return "请稍后再试，爬虫尚未生成数据"
         
     with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
-        ids = [line.strip() for line in f.readlines() if line.strip()]
+        lines = [line.strip() for line in f.readlines() if line.strip()]
     
     target_key = b"ABCDEFGHIJKLMNOPQRSTUVWX"
     
@@ -178,10 +211,21 @@ def generate_playlist(fmt="m3u", mode="clean"):
         
     index = 1
     
-    for raw_id in ids:
+    for line in lines:
         try:
-            if not raw_id: continue
-            
+            # 兼容处理判断是新版的 JSON 还是旧版的纯文本 ID
+            if line.startswith('{'):
+                item = json.loads(line)
+                raw_id = item['id']
+                # 拼接频道名：19:35 福建VS辽宁
+                channel_name = f"{item['time']} {item['home']}VS{item['away']}"
+                # 分组名固定为体育直播
+                group_title = "体育直播"
+            else:
+                raw_id = line
+                channel_name = f"体育直播 {index}"
+                group_title = "体育直播"
+
             decoded_id = urllib.parse.unquote(raw_id)
             pad = 4 - (len(decoded_id) % 4)
             if pad != 4: decoded_id += "=" * pad
@@ -194,7 +238,10 @@ def generate_playlist(fmt="m3u", mode="clean"):
                 data = json.loads(json_str)
                 
                 if 'url' in data:
-                    channel_name = data.get('name') or data.get('title') or f"体育直播 {index}"
+                    # 如果是旧版纯 ID 数据，尝试降级使用接口自带的 title
+                    if not line.startswith('{'):
+                         channel_name = data.get('name') or data.get('title') or channel_name
+
                     raw_stream_url = data["url"]
                     
                     if mode == "plus":
@@ -206,7 +253,7 @@ def generate_playlist(fmt="m3u", mode="clean"):
                     
                     # 严格按照格式拼接
                     if fmt == "m3u":
-                        content += f'#EXTINF:-1 group-title="体育直播",{channel_name}\n{stream_url}\n'
+                        content += f'#EXTINF:-1 group-title="{group_title}",{channel_name}\n{stream_url}\n'
                     else:
                         content += f'{channel_name},{stream_url}\n'
                         
